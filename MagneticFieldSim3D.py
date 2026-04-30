@@ -2,12 +2,15 @@ import numpy as np
 import time
 
 
+
 BENCHMARK = False
+
 
 
 BENCH_GRIDS   = [10, 20, 30, 50, 75, 100, 125, 150, 175, 200]
 BENCH_REPEATS = 3
 BENCH_WIRES   = ["straight", "loop", "solenoid"]
+
 
 
 MU0              = 4e-7 * np.pi
@@ -16,6 +19,7 @@ LOOP_RADIUS      = 0.5
 SOLENOID_RADIUS  = 0.35
 SOLENOID_LENGTH  = 1.2
 SOLENOID_TURNS   = 4
+
 
 
 try:
@@ -29,6 +33,7 @@ except Exception:
     HAS_GPU  = False
     cp       = None
     GPU_NAME = "Not available"
+
 
 
 _CUDA_SRC = r"""
@@ -94,12 +99,14 @@ void biot_savart_3d(
 """
 
 
+
 _kernel = None
 def _get_kernel():
     global _kernel
     if _kernel is None and HAS_GPU:
         _kernel = cp.RawKernel(_CUDA_SRC, "biot_savart_3d")
     return _kernel
+
 
 
 def _warmup_gpu():
@@ -119,27 +126,90 @@ def _warmup_gpu():
     cp.cuda.Device().synchronize()
 
 
-def make_segments(wire, num_segments=300):
-    if wire == "loop":
-        theta     = np.linspace(0, 2*np.pi, num_segments+1, dtype=np.float32)
-        x         = LOOP_RADIUS * np.cos(theta)
-        y         = LOOP_RADIUS * np.sin(theta)
-        z         = np.zeros(num_segments+1, dtype=np.float32)
-        seg_start = np.stack([x[:-1], y[:-1], z[:-1]], axis=1)
-        seg_end   = np.stack([x[1: ], y[1: ], z[1: ]], axis=1)
-    elif wire == "solenoid":
-        total_pts = num_segments + 1
-        t         = np.linspace(0, 2 * np.pi * SOLENOID_TURNS, total_pts, dtype=np.float32)
-        x         = SOLENOID_RADIUS * np.cos(t)
-        y         = SOLENOID_RADIUS * np.sin(t)
-        z         = np.linspace(-SOLENOID_LENGTH / 2, SOLENOID_LENGTH / 2, total_pts, dtype=np.float32)
-        seg_start = np.stack([x[:-1], y[:-1], z[:-1]], axis=1)
-        seg_end   = np.stack([x[1: ], y[1: ], z[1: ]], axis=1)
+
+TWO_WIRE_TYPES = ("parallel_same", "parallel_opp", "cross")
+
+
+def make_segments(wire_type, num_segments=300):
+    """Generate (seg_start, seg_end) float32 arrays for the given wire type."""
+
+    if wire_type == "straight":
+        z   = np.linspace(-1.5, 1.5, num_segments + 1, dtype=np.float32)
+        pts = np.stack([np.zeros(num_segments + 1, dtype=np.float32),
+                        np.zeros(num_segments + 1, dtype=np.float32), z], axis=1)
+        return pts[:-1], pts[1:]
+
+    elif wire_type == "loop":
+        t   = np.linspace(0, 2 * np.pi, num_segments + 1, dtype=np.float32)
+        x   = LOOP_RADIUS * np.cos(t)
+        y   = LOOP_RADIUS * np.sin(t)
+        z   = np.zeros(num_segments + 1, dtype=np.float32)
+        pts = np.stack([x, y, z], axis=1)
+        return pts[:-1], pts[1:]
+
+    elif wire_type == "solenoid":
+        t   = np.linspace(0, 2 * np.pi * SOLENOID_TURNS, num_segments + 1, dtype=np.float32)
+        x   = SOLENOID_RADIUS * np.cos(t)
+        y   = SOLENOID_RADIUS * np.sin(t)
+        z   = np.linspace(-SOLENOID_LENGTH / 2, SOLENOID_LENGTH / 2,
+                          num_segments + 1, dtype=np.float32)
+        pts = np.stack([x, y, z], axis=1)
+        return pts[:-1], pts[1:]
+
+    elif wire_type == "parallel_same":
+        half = num_segments // 2
+        rest = num_segments - half
+        z1   = np.linspace(-1.5, 1.5, half + 1, dtype=np.float32)
+        z2   = np.linspace(-1.5, 1.5, rest + 1, dtype=np.float32)
+        pts1 = np.stack([np.full(half + 1, -0.3, dtype=np.float32),
+                         np.zeros(half + 1, dtype=np.float32), z1], axis=1)
+        pts2 = np.stack([np.full(rest + 1,  0.3, dtype=np.float32),
+                         np.zeros(rest + 1, dtype=np.float32), z2], axis=1)
+        return (np.vstack([pts1[:-1], pts2[:-1]]),
+                np.vstack([pts1[1:],  pts2[1:]]))
+
+    elif wire_type == "parallel_opp":
+        half = num_segments // 2
+        rest = num_segments - half
+        z1   = np.linspace(-1.5,  1.5, half + 1, dtype=np.float32)
+        z2   = np.linspace( 1.5, -1.5, rest + 1, dtype=np.float32)   # reversed current
+        pts1 = np.stack([np.full(half + 1, -0.3, dtype=np.float32),
+                         np.zeros(half + 1, dtype=np.float32), z1], axis=1)
+        pts2 = np.stack([np.full(rest + 1,  0.3, dtype=np.float32),
+                         np.zeros(rest + 1, dtype=np.float32), z2], axis=1)
+        return (np.vstack([pts1[:-1], pts2[:-1]]),
+                np.vstack([pts1[1:],  pts2[1:]]))
+
+    elif wire_type == "cross":
+        half = num_segments // 2
+        rest = num_segments - half
+        z    = np.linspace(-1.5, 1.5, half + 1, dtype=np.float32)
+        x    = np.linspace(-1.5, 1.5, rest + 1, dtype=np.float32)
+        pts1 = np.stack([np.zeros(half + 1, dtype=np.float32),
+                         np.zeros(half + 1, dtype=np.float32), z], axis=1)
+        pts2 = np.stack([x,
+                         np.full(rest + 1, 0.05, dtype=np.float32),
+                         np.zeros(rest + 1, dtype=np.float32)], axis=1)
+        return (np.vstack([pts1[:-1], pts2[:-1]]),
+                np.vstack([pts1[1:],  pts2[1:]]))
+
     else:
-        z         = np.linspace(-1.5, 1.5, num_segments+1, dtype=np.float32)
-        seg_start = np.stack([np.zeros(num_segments), np.zeros(num_segments), z[:-1]], axis=1)
-        seg_end   = np.stack([np.zeros(num_segments), np.zeros(num_segments), z[1: ]], axis=1)
-    return seg_start.astype(np.float32), seg_end.astype(np.float32)
+        raise ValueError(f"Unknown wire type: {wire_type!r}")
+
+
+
+def _wire_subsegments(wire_type, seg_start, seg_end, num_segments):
+    """Split concatenated segment arrays back into per-wire lists for correct masking."""
+    if wire_type in TWO_WIRE_TYPES:
+        half = num_segments // 2
+        rest = num_segments - half
+        return (
+            [seg_start[:half],  seg_start[half:]],
+            [seg_end[:half],    seg_end[half:]],
+            [half, rest],
+        )
+    return [seg_start], [seg_end], [num_segments]
+
 
 
 def _make_grid(grid_size, plane="XY", offset=0.0):
@@ -156,74 +226,94 @@ def _make_grid(grid_size, plane="XY", offset=0.0):
     return gx, gy, gz
 
 
+
 def _make_volume_grid(grid_size):
     coords = np.linspace(-EXTENT, EXTENT, grid_size, dtype=np.float32)
     gx, gy, gz = np.meshgrid(coords, coords, coords)
     return gx, gy, gz
 
 
+
 def bs_cpu(I, gx, gy, gz, wire="straight", num_segments=300, mask_r=0.04):
     seg_start, seg_end = make_segments(wire, num_segments)
-    seg_vec = seg_end - seg_start
-    points  = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1).astype(np.float64)
+    starts_list, ends_list, counts_list = _wire_subsegments(wire, seg_start, seg_end, num_segments)
 
-    vec_to_start  = points[:, None, :] - seg_start[None].astype(np.float64)
-    vec_to_end    = points[:, None, :] - seg_end[None].astype(np.float64)
-    cross_product = np.cross(vec_to_start, vec_to_end, axis=2)
-    dist_to_start = np.linalg.norm(vec_to_start, axis=2)
-    dist_to_end   = np.linalg.norm(vec_to_end,   axis=2)
-    dot_product   = np.einsum("ijk,ijk->ij", vec_to_start, vec_to_end)
-    denominator   = dist_to_start * dist_to_end * (dist_to_start * dist_to_end + dot_product) + 1e-30
-    scalar_factor = (dist_to_start + dist_to_end) / denominator
-    prefactor     = MU0 * I / (4 * np.pi)
-    B_field       = prefactor * np.sum(cross_product * scalar_factor[:, :, None], axis=1)
-
-    seg_vec_d      = seg_vec.astype(np.float64)
-    seg_len_sq     = np.einsum("ij,ij->i", seg_vec_d, seg_vec_d) + 1e-30
-    proj_param     = np.einsum("mij,ij->mi", points[:, None, :] - seg_start[None].astype(np.float64), seg_vec_d) / seg_len_sq
-    proj_param     = np.clip(proj_param, 0.0, 1.0)
-    nearest_points = seg_start[None].astype(np.float64) + proj_param[:, :, None] * seg_vec_d[None]
-    dist_sq        = np.sum((points[:, None, :] - nearest_points)**2, axis=2)
-    B_field[np.sqrt(np.min(dist_sq, axis=1)) < mask_r] = 0.0
-
+    points     = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1).astype(np.float64)
     grid_shape = gx.shape
-    return (B_field[:, 0].reshape(grid_shape),
-            B_field[:, 1].reshape(grid_shape),
-            B_field[:, 2].reshape(grid_shape))
+    B_total    = np.zeros((points.shape[0], 3), dtype=np.float64)
+    prefactor  = MU0 * I / (4 * np.pi)
+
+    for w_start, w_end in zip(starts_list, ends_list):
+        w_start = w_start.astype(np.float64)
+        w_end   = w_end.astype(np.float64)
+        seg_vec = w_end - w_start
+
+        vec_to_start  = points[:, None, :] - w_start[None]
+        vec_to_end    = points[:, None, :] - w_end[None]
+        cross_product = np.cross(vec_to_start, vec_to_end, axis=2)
+        dist_to_start = np.linalg.norm(vec_to_start, axis=2)
+        dist_to_end   = np.linalg.norm(vec_to_end,   axis=2)
+        dot_product   = np.einsum("ijk,ijk->ij", vec_to_start, vec_to_end)
+        denominator   = dist_to_start * dist_to_end * (dist_to_start * dist_to_end + dot_product) + 1e-30
+        scalar_factor = (dist_to_start + dist_to_end) / denominator
+        B_wire        = prefactor * np.sum(cross_product * scalar_factor[:, :, None], axis=1)
+
+        seg_len_sq     = np.einsum("ij,ij->i", seg_vec, seg_vec) + 1e-30
+        proj_param     = np.einsum("mij,ij->mi",
+                             points[:, None, :] - w_start[None], seg_vec) / seg_len_sq
+        proj_param     = np.clip(proj_param, 0.0, 1.0)
+        nearest_points = w_start[None] + proj_param[:, :, None] * seg_vec[None]
+        dist_sq        = np.sum((points[:, None, :] - nearest_points) ** 2, axis=2)
+        B_wire[np.sqrt(np.min(dist_sq, axis=1)) < mask_r] = 0.0
+
+        B_total += B_wire
+
+    return (B_total[:, 0].reshape(grid_shape),
+            B_total[:, 1].reshape(grid_shape),
+            B_total[:, 2].reshape(grid_shape))
+
 
 
 def bs_gpu(I, gx, gy, gz, wire="straight", num_segments=300, mask_r=0.04):
     seg_start, seg_end = make_segments(wire, num_segments)
+    starts_list, ends_list, counts_list = _wire_subsegments(wire, seg_start, seg_end, num_segments)
+
     num_points = gx.size
     grid_xyz   = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1).astype(np.float32)
+    points_gpu = cp.ascontiguousarray(cp.asarray(grid_xyz))
+    prefactor  = np.float32(MU0 * I / (4 * np.pi))
 
-    points_gpu      = cp.ascontiguousarray(cp.asarray(grid_xyz))
-    field_gpu       = cp.zeros((num_points, 3), dtype=cp.float32)
-    seg_start_x_gpu = cp.asarray(seg_start[:, 0])
-    seg_start_y_gpu = cp.asarray(seg_start[:, 1])
-    seg_start_z_gpu = cp.asarray(seg_start[:, 2])
-    seg_end_x_gpu   = cp.asarray(seg_end[:, 0])
-    seg_end_y_gpu   = cp.asarray(seg_end[:, 1])
-    seg_end_z_gpu   = cp.asarray(seg_end[:, 2])
-
-    prefactor         = np.float32(MU0 * I / (4 * np.pi))
     threads_per_block = 256
     num_blocks        = (num_points + threads_per_block - 1) // threads_per_block
+    field_total       = cp.zeros((num_points, 3), dtype=cp.float32)
 
-    _get_kernel()(
-        (num_blocks,), (threads_per_block,),
-        (points_gpu.ravel(),
-         seg_start_x_gpu, seg_start_y_gpu, seg_start_z_gpu,
-         seg_end_x_gpu,   seg_end_y_gpu,   seg_end_z_gpu,
-         field_gpu.ravel(), np.int32(num_points), np.int32(num_segments), prefactor, np.float32(mask_r))
-    )
-    cp.cuda.Device().synchronize()
+    for w_start, w_end, w_count in zip(starts_list, ends_list, counts_list):
+        field_gpu       = cp.zeros((num_points, 3), dtype=cp.float32)
+        seg_start_x_gpu = cp.asarray(w_start[:, 0])
+        seg_start_y_gpu = cp.asarray(w_start[:, 1])
+        seg_start_z_gpu = cp.asarray(w_start[:, 2])
+        seg_end_x_gpu   = cp.asarray(w_end[:, 0])
+        seg_end_y_gpu   = cp.asarray(w_end[:, 1])
+        seg_end_z_gpu   = cp.asarray(w_end[:, 2])
 
-    field_result = cp.asnumpy(field_gpu)
+        _get_kernel()(
+            (num_blocks,), (threads_per_block,),
+            (points_gpu.ravel(),
+             seg_start_x_gpu, seg_start_y_gpu, seg_start_z_gpu,
+             seg_end_x_gpu,   seg_end_y_gpu,   seg_end_z_gpu,
+             field_gpu.ravel(),
+             np.int32(num_points), np.int32(w_count),
+             prefactor, np.float32(mask_r))
+        )
+        cp.cuda.Device().synchronize()
+        field_total += field_gpu
+
+    field_result = cp.asnumpy(field_total)
     grid_shape   = gx.shape
     return (field_result[:, 0].reshape(grid_shape),
             field_result[:, 1].reshape(grid_shape),
             field_result[:, 2].reshape(grid_shape))
+
 
 
 def run_benchmark():
@@ -272,6 +362,7 @@ def run_benchmark():
         print("=" * 65)
 
 
+
 def run_gui():
     import tkinter as tk
     from tkinter import ttk
@@ -282,8 +373,9 @@ def run_gui():
     from mpl_toolkits.mplot3d import Axes3D
     from matplotlib import cm, colors as mcolors
 
+
     def draw_quiver_3d(ax, gx, gy, gz, Bx, By, Bz, skip, arrow_len, log_norm):
-        s          = slice(None, None, skip)
+        s  = slice(None, None, skip)
         x  = gx.ravel()[::skip] if gx.ndim == 3 else gx[s, s].ravel()
         y  = gy.ravel()[::skip] if gy.ndim == 3 else gy[s, s].ravel()
         z  = gz.ravel()[::skip] if gz.ndim == 3 else gz[s, s].ravel()
@@ -302,6 +394,7 @@ def run_gui():
                   colors=colors_arr, length=1.0, normalize=False,
                   arrow_length_ratio=0.3, linewidth=0.8, alpha=0.88)
 
+
     def draw_wire_3d(ax, wire_type, I_sign):
         t = np.linspace(0, 2 * np.pi, 300)
         if wire_type == "loop":
@@ -309,14 +402,31 @@ def run_gui():
                     np.zeros(300), "-", color="red", lw=2.0, alpha=0.9, zorder=5)
         elif wire_type == "solenoid":
             ts = np.linspace(0, 2 * np.pi * SOLENOID_TURNS, 600)
-            xs = SOLENOID_RADIUS * np.cos(ts)
-            ys = SOLENOID_RADIUS * np.sin(ts)
-            zs = np.linspace(-SOLENOID_LENGTH / 2, SOLENOID_LENGTH / 2, 600)
-            ax.plot(xs, ys, zs, "-", color="red", lw=2.0, alpha=0.9, zorder=5)
-        else:
+            ax.plot(SOLENOID_RADIUS * np.cos(ts), SOLENOID_RADIUS * np.sin(ts),
+                    np.linspace(-SOLENOID_LENGTH / 2, SOLENOID_LENGTH / 2, 600),
+                    "-", color="red", lw=2.0, alpha=0.9, zorder=5)
+        elif wire_type in ("parallel_same", "parallel_opp"):
+            z_ends = [-1.5, 1.5]
+            ax.plot([-0.3, -0.3], [0, 0], z_ends, "-", color="red", lw=2.5, alpha=0.9, zorder=5)
+            color2 = "blue" if wire_type == "parallel_opp" else "red"
+            ax.plot([ 0.3,  0.3], [0, 0],
+                    z_ends if wire_type == "parallel_same" else z_ends[::-1],
+                    "-", color=color2, lw=2.5, alpha=0.9, zorder=5)
+            sym1 = "\u2299" if I_sign > 0 else "\u2297"
+            sym2 = sym1 if wire_type == "parallel_same" else ("\u2297" if I_sign > 0 else "\u2299")
+            ax.text(-0.3, 0, 1.6, sym1, color="red",   fontsize=9, ha="center")
+            ax.text( 0.3, 0, 1.6, sym2, color=color2,  fontsize=9, ha="center")
+        elif wire_type == "cross":
+            ax.plot([0, 0],       [0, 0],       [-1.5, 1.5], "-", color="red",  lw=2.5, alpha=0.9, zorder=5)
+            ax.plot([-1.5, 1.5],  [0.05, 0.05], [0, 0],      "-", color="blue", lw=2.5, alpha=0.9, zorder=5)
+            sym = "\u2299" if I_sign > 0 else "\u2297"
+            ax.text(0,    0.0,  1.6, sym,      color="red",  fontsize=9,  ha="center")
+            ax.text(1.65, 0.05, 0.0, "\u2192", color="blue", fontsize=10, ha="left")
+        else:  # straight
+            sym = "\u2299" if I_sign > 0 else "\u2297"
             ax.plot([0, 0], [0, 0], [-1.5, 1.5], "-", color="red", lw=2.5, alpha=0.9, zorder=5)
-            symbol = "⊙" if I_sign > 0 else "⊗"
-            ax.text(0, 0, 1.55, symbol, color="red", fontsize=10, ha="center", va="bottom")
+            ax.text(0, 0, 1.55, sym, color="red", fontsize=10, ha="center", va="bottom")
+
 
     root = tk.Tk()
     root.title("3D Biot-Savart Simulator")
@@ -349,7 +459,8 @@ def run_gui():
         return lf
 
     def make_slider(parent, label, var, lo, hi, res):
-        row = tk.Frame(parent, bg=bg_color); row.pack(fill=tk.X, pady=2)
+        row = tk.Frame(parent, bg=bg_color)
+        row.pack(fill=tk.X, pady=2)
         tk.Label(row, text=label, width=12, anchor="w",
                  bg=bg_color, font=("Helvetica", 9)).pack(side=tk.LEFT)
         tk.Label(row, textvariable=var, width=6, anchor="e",
@@ -362,15 +473,23 @@ def run_gui():
     gpu_status_color = "#006600" if HAS_GPU else "#990000"
     tk.Label(backend_section, text=f"GPU: {GPU_NAME}",
              fg=gpu_status_color, bg=bg_color, font=("Helvetica", 8)).pack(anchor="w")
-    BACKENDS    = ["CPU – NumPy"] + (["GPU – CUDA"] if HAS_GPU else [])
-    backend_var = tk.StringVar(value="GPU – CUDA" if HAS_GPU else BACKENDS[0])
+    BACKENDS    = ["CPU \u2013 NumPy"] + (["GPU \u2013 CUDA"] if HAS_GPU else [])
+    backend_var = tk.StringVar(value=BACKENDS[-1] if HAS_GPU else BACKENDS[0])
     ttk.Combobox(backend_section, textvariable=backend_var, values=BACKENDS,
                  state="readonly", width=22, font=("Helvetica", 9)).pack(fill=tk.X, pady=(4, 0))
 
     wire_section = section("Wire Type")
-    wire_var = tk.StringVar(value="straight")
-    for w in ["straight", "loop", "solenoid"]:
-        tk.Radiobutton(wire_section, text=w.capitalize(), variable=wire_var, value=w,
+    wire_var     = tk.StringVar(value="straight")
+    WIRE_OPTIONS = [
+        ("straight",      "Straight wire"),
+        ("loop",          "Loop"),
+        ("solenoid",      "Solenoid"),
+        ("parallel_same", "Parallel \u2191\u2191"),
+        ("parallel_opp",  "Parallel \u2191\u2193"),
+        ("cross",         "Cross wire (\u22a5)"),
+    ]
+    for val, label in WIRE_OPTIONS:
+        tk.Radiobutton(wire_section, text=label, variable=wire_var, value=val,
                        bg=bg_color, font=("Helvetica", 9),
                        command=lambda: _debounce()).pack(anchor="w")
 
@@ -408,20 +527,20 @@ def run_gui():
     vol_warn.pack(anchor="w")
 
     current_section = section("Current")
-    I_mag_var = tk.DoubleVar(value=1.0)
+    I_mag_var       = tk.DoubleVar(value=1.0)
     make_slider(current_section, "I  (A)", I_mag_var, 0.5, 20.0, 0.5)
     I_sign = [+1]
-    direction_label_var = tk.StringVar(value="Direction:  ↑")
+    direction_label_var = tk.StringVar(value="Direction:  \u2191")
 
     def toggle_dir():
         I_sign[0] *= -1
-        direction_label_var.set("Direction:  ↑" if I_sign[0] > 0
-                                else "Direction:  ↓")
+        direction_label_var.set("Direction:  \u2191" if I_sign[0] > 0
+                                else "Direction:  \u2193")
         direction_button.config(bg="#e8f0e8" if I_sign[0] > 0 else "#f0e8e8")
         _debounce()
 
-    direction_button = tk.Button(current_section, textvariable=direction_label_var, bg="#e8f0e8",
-                                 relief="groove", font=("Helvetica", 9),
+    direction_button = tk.Button(current_section, textvariable=direction_label_var,
+                                 bg="#e8f0e8", relief="groove", font=("Helvetica", 9),
                                  cursor="hand2", command=toggle_dir)
     direction_button.pack(fill=tk.X, pady=(6, 0))
 
@@ -432,11 +551,11 @@ def run_gui():
     make_slider(computation_section, "Arrow skip", skip_var, 1,  8, 1)
 
     timing_section = section("Timing")
-    cpu_time_label = tk.Label(timing_section, text="CPU  —", bg=bg_color, font=("Courier", 10),
-                              fg="#004488", anchor="w")
+    cpu_time_label = tk.Label(timing_section, text="CPU  \u2014", bg=bg_color,
+                              font=("Courier", 10), fg="#004488", anchor="w")
     cpu_time_label.pack(fill=tk.X)
-    gpu_time_label = tk.Label(timing_section, text="GPU  —", bg=bg_color, font=("Courier", 10),
-                              fg="#006600", anchor="w")
+    gpu_time_label = tk.Label(timing_section, text="GPU  \u2014", bg=bg_color,
+                              font=("Courier", 10), fg="#006600", anchor="w")
     gpu_time_label.pack(fill=tk.X)
     speedup_label = tk.Label(timing_section, text="", bg=bg_color, font=("Courier", 9),
                              fg="#880000", anchor="w")
@@ -460,9 +579,8 @@ def run_gui():
 
     def _on_mode_change():
         n = int(vol_pts_var.get())
-        total = n ** 3
         if mode_var.get() == "volume":
-            vol_warn.config(text=f"{total:,} pts — use small grids (≤12) on CPU")
+            vol_warn.config(text=f"{n**3:,} pts \u2014 use small grids (\u226412) on CPU")
         else:
             vol_warn.config(text="")
         _debounce()
@@ -470,7 +588,7 @@ def run_gui():
     def _update_vol_warn(*_):
         if mode_var.get() == "volume":
             n = int(vol_pts_var.get())
-            vol_warn.config(text=f"{n**3:,} pts — use small grids (≤12) on CPU")
+            vol_warn.config(text=f"{n**3:,} pts \u2014 use small grids (\u226412) on CPU")
 
     def refresh():
         wire_type = wire_var.get()
@@ -491,20 +609,8 @@ def run_gui():
                 Bx, By, Bz = bs_gpu(I, gx, gy, gz, wire=wire_type)
             else:
                 Bx, By, Bz = bs_cpu(I, gx, gy, gz, wire=wire_type)
-            all_grids = [(gx, gy, gz, Bx, By, Bz)]
+            all_grids  = [(gx, gy, gz, Bx, By, Bz)]
             num_points = vol_n ** 3
-
-        elif mode == "planes":
-            all_grids = []
-            for pl in ["XY", "XZ", "YZ"]:
-                off = offset if pl == plane else 0.0
-                gx, gy, gz = _make_grid(grid_size, plane=pl, offset=off)
-                if use_gpu:
-                    Bx, By, Bz = bs_gpu(I, gx, gy, gz, wire=wire_type)
-                else:
-                    Bx, By, Bz = bs_cpu(I, gx, gy, gz, wire=wire_type)
-                all_grids.append((gx, gy, gz, Bx, By, Bz))
-            num_points = grid_size * grid_size * 3
 
         else:
             gx, gy, gz = _make_grid(grid_size, plane=plane, offset=offset)
@@ -512,7 +618,7 @@ def run_gui():
                 Bx, By, Bz = bs_gpu(I, gx, gy, gz, wire=wire_type)
             else:
                 Bx, By, Bz = bs_cpu(I, gx, gy, gz, wire=wire_type)
-            all_grids = [(gx, gy, gz, Bx, By, Bz)]
+            all_grids  = [(gx, gy, gz, Bx, By, Bz)]
             num_points = grid_size * grid_size
 
         elapsed_ms = (time.perf_counter() - t0) * 1e3
@@ -533,8 +639,8 @@ def run_gui():
             for (_, _, _, Bx, By, Bz) in all_grids
         ])
         all_nonzero = all_nonzero[all_nonzero > 0]
-        vmin = float(all_nonzero.min()) if len(all_nonzero) else 1e-9
-        vmax = float(np.percentile(all_nonzero, 98)) if len(all_nonzero) else 1e-6
+        vmin     = float(all_nonzero.min())      if len(all_nonzero) else 1e-9
+        vmax     = float(np.percentile(all_nonzero, 98)) if len(all_nonzero) else 1e-6
         log_norm = mcolors.LogNorm(vmin=max(vmin, 1e-30), vmax=max(vmax, 1e-29))
 
         ax.cla()
@@ -556,20 +662,16 @@ def run_gui():
         ax.set_zlabel("z [m]", fontsize=8)
         ax.tick_params(labelsize=7)
 
-        wire_label    = (f"Loop R={LOOP_RADIUS}m" if wire_type == "loop" else
-                         f"Solenoid R={SOLENOID_RADIUS}m N={SOLENOID_TURNS}" if wire_type == "solenoid" else
-                         "Straight wire")
+        wire_label = (f"Loop R={LOOP_RADIUS}m"        if wire_type == "loop"     else
+                      f"Solenoid R={SOLENOID_RADIUS}m N={SOLENOID_TURNS}" if wire_type == "solenoid" else
+                      wire_type.replace("_", " ").title())
         backend_label = "GPU" if use_gpu else "CPU"
-        if mode == "volume":
-            mode_label = f"3D volume {vol_n}³"
-        elif mode == "planes":
-            mode_label = "XY+XZ+YZ"
-        else:
-            off_str = f" offset={offset:+.2f}m" if abs(offset) > 1e-3 else ""
-            mode_label = f"{plane}{off_str}"
+        off_str    = f" offset={offset:+.2f}m" if abs(offset) > 1e-3 else ""
+        mode_label = f"3D volume {vol_n}\u00b3" if mode == "volume" else f"{plane}{off_str}"
         ax.set_title(f"{wire_label}   I={I:+.1f}A   {mode_label}   [{backend_label}]", fontsize=9)
 
-        points_info_label.config(text=f"{num_points:,} pts × 300 segs = {num_points*300:,} ops")
+        points_info_label.config(
+            text=f"{num_points:,} pts \u00d7 300 segs = {num_points*300:,} ops")
         canvas.draw_idle()
 
     for v in (backend_var, wire_var, I_mag_var, pts_var, skip_var, offset_var, vol_pts_var):
@@ -581,6 +683,7 @@ def run_gui():
         _warmup_gpu()
     refresh()
     root.mainloop()
+
 
 
 if __name__ == "__main__":
